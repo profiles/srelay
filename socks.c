@@ -744,7 +744,7 @@ int build_socks_request(SOCKS_STATE *state, u_char *buf, int ver)
 */
 int socks_proxy_reply(int v, SOCKS_STATE *state)
 {
-  int	r, c, len;
+  int	r, c, len, n;
   u_char buf[512];
   struct addrinfo hints, *res, *res0;
   int	error;
@@ -768,26 +768,28 @@ int socks_proxy_reply(int v, SOCKS_STATE *state)
   while (c-- > 0) {
     memset(&ss, 0, SS_LEN);
     /* read server reply */
-    r = timerd_read(state->r, buf, sizeof buf, TIMEOUTSEC, 0);
-
-    if (state->cur > 0) {  /* special case */
-      if ((v == 5 && buf[1] == S5AGRANTED)
-	  || (v == 4 && buf[1] == S4AGRANTED)) {
-	return(0);
-      }
-      return(-1);
-    }
+    r = timerd_read(state->r, buf, 2, TIMEOUTSEC, 0);
 
     switch (v) { /* server socks version */
 
     case 4: /* server v:4 */
-      if ( r < 8 ) {  /* from v4 spec, r should be 8 */
+      n = timerd_read(state->r, buf + 2, 6, TIMEOUTSEC, 0);
+      if ( n == -1 || n < 6 ) {  /* from v4 spec, r should be 8 */
 	/* cannot read server reply */
 	r = -1;
 	break;
       }
+      r += n;
       switch (state->sr.ver) {  /* client ver */
       case 4: /* same version */
+        n = get_str(state->r, (char *)(buf + 8), sizeof(buf) - 8);
+        if (n < 0 || n > 255) {
+          /* invalid username length */
+          GEN_ERR_REP(state->s, 4);
+          return(-1);
+        }
+        r += n + 1;
+        if(state->cur < 1)
 	r = timerd_write(state->s, buf, r, TIMEOUTSEC);
 	break;
 
@@ -797,6 +799,7 @@ int socks_proxy_reply(int v, SOCKS_STATE *state)
 	  ss.v4.sin_family = AF_INET;
 	  memcpy(&(ss.v4.sin_addr), &buf[4], 4);
 	  memcpy(&(ss.v4.sin_port), &buf[2], 2);
+          if(state->cur < 1)
 	  r = socks_rep(state->s, 5, S5AGRANTED, &ss);
 	} else {
 	  r = -1;
@@ -809,22 +812,35 @@ int socks_proxy_reply(int v, SOCKS_STATE *state)
       break;
 
     case 5: /* server v:5 */
-      if ( r < 7 ) {   /* should be 10 or more */
+      n = timerd_read(state->r, buf + 2, 2, TIMEOUTSEC, 0);
+      if ( n < 2 ) {
 	/* cannot read server reply */
 	r = -1;
 	break;
       }
+      /* should be 10 or more */
+      r += n;
       switch (state->sr.ver) { /* client ver */
       case 4:
 	/* translate reply v5->v4 */
 	if ( buf[1] == S5AGRANTED ) {
 	  switch (buf[3]) {   /* address type */
 	  case S5ATIPV4:
+            n = timerd_read(state->r, buf + 4, 6, TIMEOUTSEC, 0);
+            if ( n < 6 ) {
+              r = -1;
+              break;
+            }
 	    ss.v4.sin_family = AF_INET;
 	    memcpy(&(ss.v4.sin_addr), &buf[4], 4);
 	    memcpy(&(ss.v4.sin_port), &buf[8], 2);
 	    break;
 	  case S5ATIPV6:
+            n = timerd_read(state->r, buf + 4, 18, TIMEOUTSEC, 0);
+            if ( n < 18 ) {
+              r = -1;
+              break;
+            }
 	    /* basically v4 cannot handle IPv6 address */
 	    /* make fake IPv4 to forcing reply */
 	    ss.v4.sin_family = AF_INET;
@@ -833,8 +849,10 @@ int socks_proxy_reply(int v, SOCKS_STATE *state)
 	    break;
 	  case S5ATFQDN:
 	  default:
+            timerd_read(state->r, buf + 4, 1, TIMEOUTSEC, 0);
 	    ss.v4.sin_family = AF_INET;
 	    len = buf[4] & 0xff;
+            timerd_read(state->r, buf + 5, len + 2, TIMEOUTSEC, 0);
 	    memcpy(&(ss.v4.sin_port), &buf[5+len], 2);
 	    buf[5+len] = '\0';
 	    memset(&hints, 0, sizeof(hints));
@@ -858,12 +876,39 @@ int socks_proxy_reply(int v, SOCKS_STATE *state)
 	    }
 	    break;
 	  }
+          if(state->cur < 1)
 	  r = socks_rep(state->s, 4, S4AGRANTED, &ss);
 	} else {
 	  r = -1;
 	}
 	break;
       case 5: /* same version */
+        switch (buf[3]) {   /* address type */
+          case S5ATIPV4:
+            n = timerd_read(state->r, buf + 4, 6, TIMEOUTSEC, 0);
+            if ( n < 6 ) {
+              r = -1;
+              break;
+            }
+            r += n;
+            break;
+          case S5ATIPV6:
+            n = timerd_read(state->r, buf + 4, 18, TIMEOUTSEC, 0);
+            if ( n < 18 ) {
+              r = -1;
+              break;
+            }
+            r += n;
+            break;
+          case S5ATFQDN:
+          default:
+            timerd_read(state->r, buf + 4, 1, TIMEOUTSEC, 0);
+            len = buf[4] & 0xff;
+            timerd_read(state->r, buf + 5, len + 2, TIMEOUTSEC, 0);
+            r += 1 + len + 2;
+            break;
+          }
+          if(state->cur < 1)
 	r = timerd_write(state->s, buf, r, TIMEOUTSEC);
 	break;
       default:
@@ -1436,9 +1481,14 @@ int wait_for_read(int s, long sec)
 
 ssize_t timerd_read(int s, u_char *buf, size_t len, int sec, int flags)
 {
-  ssize_t r = -1;
+  ssize_t r = 0, c = 0;
   settimer(sec);
-  r = recvfrom(s, buf, len, flags, 0, 0);
+  while(r < len){
+    c = recvfrom(s, buf + r, len - r, flags, 0, 0);
+    if(c <= 0)
+      break;
+    r += c;
+  }
   settimer(0);
   return(r);
 }
